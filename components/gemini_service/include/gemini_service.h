@@ -67,7 +67,7 @@ struct Result {
     std::string message;
 };
 
-// Result of a synchronous text-generation (generateContent) call.
+// Result of a synchronous text-generation (OpenRouter chat completions) call.
 struct TextResult {
     bool success = false;
     int http_status = 0;
@@ -76,16 +76,7 @@ struct TextResult {
     std::string error_message = {};
 };
 
-// Result of a synchronous token-count (countTokens) call.
-struct TokenCountResult {
-    bool success = false;
-    int http_status = 0;
-    int total_tokens = 0;
-    std::string error_code = {};
-    std::string error_message = {};
-};
-
-// Result of a synchronous audio transcription (resumable upload + generateContent) call.
+// Result of a synchronous audio transcription (OpenRouter multipart WAV upload) call.
 struct TranscriptionResult {
     bool success = false;
     int http_status = 0;
@@ -111,10 +102,9 @@ Result ClearStoredApiKey();
 bool HasApiKey();
 std::string GetEffectiveApiKey();
 std::string GetEffectiveModelName();
-// Synchronous Gemini calls (block on HTTP; run them from a worker task, never a UI/input
+// Synchronous OpenRouter calls (block on HTTP; run them from a worker task, never a UI/input
 // task). They use the effective API key + model and return the parsed result or an error.
 TextResult GenerateText(const std::string& prompt);
-TokenCountResult CountTokens(const std::string& prompt);
 TranscriptionResult Transcribe(const recording_service::RecordedClip& clip);
 bool BeginAuthentication();
 void SetNetworkState(bool connected, bool access_point_mode);

@@ -187,7 +187,7 @@ export function createProviderKeysController(deps: ProviderKeysDeps) {
 
     const apiKey = deps.geminiApiKeyInput.value.trim();
     if (!apiKey) {
-      deps.notifyGemini('Gemini API key is required.', 'warning');
+      deps.notifyGemini('OpenRouter API key is required.', 'warning');
       return;
     }
 
@@ -197,8 +197,8 @@ export function createProviderKeysController(deps: ProviderKeysDeps) {
       deps.notifyGemini,
       deps.updateButtons,
       deps.fetchGeminiModuleJson,
-      'Saving Gemini API key...',
-      'Gemini API key'
+      'Saving OpenRouter API key...',
+      'OpenRouter API key'
     );
   }
 
@@ -213,8 +213,8 @@ export function createProviderKeysController(deps: ProviderKeysDeps) {
       deps.notifyGemini,
       deps.updateButtons,
       deps.fetchGeminiModuleJson,
-      'Clearing Gemini API key...',
-      'Gemini API key cleared.'
+      'Clearing OpenRouter API key...',
+      'OpenRouter API key cleared.'
     );
   }
 

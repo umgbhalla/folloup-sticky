@@ -1,5 +1,9 @@
 # Followup App Architecture
 
+The local OpenRouter port replaces Gemini transport. See `gemini-service.md`
+for current endpoints, model settings, and key storage. The internal component
+name remains `gemini_service`; provider descriptions below predate this port.
+
 This project is an ESP-IDF C++17 firmware application for the
 [Waveshare ESP32-S3-ePaper-3.97](https://docs.waveshare.com/ESP32-S3-ePaper-3.97).
 The board details are in `docs/waveshare-epaper-hardware-spec.md`.

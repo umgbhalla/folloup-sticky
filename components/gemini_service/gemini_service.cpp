@@ -1,4 +1,6 @@
 #include "gemini_service.h"
+#include "openrouter_protocol.h"
+#include <climits>
 
 #include <algorithm>
 #include <array>
@@ -28,12 +30,12 @@
 namespace gemini_service {
 namespace {
 
-constexpr const char* kTag = "GeminiService";
-constexpr const char* kSettingsTag = "GeminiSettings";
-constexpr const char* kStorageNamespace = "gemini";
+constexpr const char* kTag = "OpenRouterService";
+constexpr const char* kSettingsTag = "OpenRouterSettings";
+constexpr const char* kStorageNamespace = "openrouter";
 constexpr const char* kStorageApiKey = "api_key";
-constexpr const char* kDefaultModelName = "models/gemini-2.5-flash-lite";
-constexpr const char* kGeminiApiBaseUrl = "https://generativelanguage.googleapis.com/v1beta/";
+constexpr const char* kDefaultModelName = CONFIG_FOLLOWUP_OPENROUTER_TEXT_MODEL;
+constexpr const char* kOpenRouterApiBaseUrl = "https://openrouter.ai/api/v1/";
 constexpr const char* kPortalApiSettingsGeminiUri = "/api/settings/gemini";
 constexpr const char* kPortalApiSettingsGeminiResetUri = "/api/settings/gemini/reset";
 constexpr const char* kPortalApiRuntimeGeminiUri = "/api/runtime/gemini";
@@ -42,15 +44,10 @@ constexpr int kAuthTimeoutMs = 15000;
 constexpr int kGenerateTimeoutMs = 60000;  // text generation can be slow for large prompts
 constexpr uint32_t kAuthTaskStackWords = 8192;
 
-// Audio transcription (resumable file upload + generateContent-with-fileData).
-constexpr const char* kUploadUrl =
-    "https://generativelanguage.googleapis.com/upload/v1beta/files";
-constexpr const char* kAudioMimeType = "audio/wav";
-constexpr const char* kTranscriptPrompt =
-    "Generate a verbatim transcript of the speech in this audio. Respond with transcript text "
-    "only. Do not add commentary or formatting.";
-constexpr int kTranscribeTimeoutMs = 30000;
+// Stream WAV directly as multipart data; no second audio buffer in PSRAM.
+constexpr int kTranscribeTimeoutMs = 60000;
 constexpr size_t kHttpUploadChunkSamples = 2048;
+constexpr size_t kMaxResponseBytes = 256 * 1024;
 
 struct AuthResult {
     bool success = false;
@@ -63,10 +60,10 @@ struct AuthResult {
 
 struct HttpResponse {
     int status_code = 0;
+    uint64_t upload_elapsed_ms = 0;
     std::string body;
     std::string error_code;
     std::string error_message;
-    std::string upload_url;  // captured from the x-goog-upload-url header (resumable upload)
 };
 
 struct AuthTaskContext {
@@ -138,7 +135,7 @@ std::string LoadStoredApiKey()
         return {};
     }
     if (err != ESP_OK) {
-        ESP_LOGW(kSettingsTag, "Failed to open Gemini NVS namespace: %s", esp_err_to_name(err));
+        ESP_LOGW(kSettingsTag, "Failed to open OpenRouter NVS namespace: %s", esp_err_to_name(err));
         return {};
     }
 
@@ -152,7 +149,7 @@ bool SaveStoredApiKey(const std::string& api_key)
     nvs_handle_t handle = 0;
     esp_err_t err = nvs_open(kStorageNamespace, NVS_READWRITE, &handle);
     if (err != ESP_OK) {
-        ESP_LOGE(kSettingsTag, "Failed to open Gemini NVS namespace for write: %s",
+        ESP_LOGE(kSettingsTag, "Failed to open OpenRouter NVS namespace for write: %s",
                  esp_err_to_name(err));
         return false;
     }
@@ -164,7 +161,7 @@ bool SaveStoredApiKey(const std::string& api_key)
     nvs_close(handle);
 
     if (err != ESP_OK) {
-        ESP_LOGE(kSettingsTag, "Failed to save Gemini API key: %s", esp_err_to_name(err));
+        ESP_LOGE(kSettingsTag, "Failed to save OpenRouter API key: %s", esp_err_to_name(err));
         return false;
     }
     return true;
@@ -178,7 +175,7 @@ bool ClearStoredApiKeyFromNvs()
         return true;
     }
     if (err != ESP_OK) {
-        ESP_LOGE(kSettingsTag, "Failed to open Gemini NVS namespace for clear: %s",
+        ESP_LOGE(kSettingsTag, "Failed to open OpenRouter NVS namespace for clear: %s",
                  esp_err_to_name(err));
         return false;
     }
@@ -193,7 +190,7 @@ bool ClearStoredApiKeyFromNvs()
     nvs_close(handle);
 
     if (err != ESP_OK) {
-        ESP_LOGE(kSettingsTag, "Failed to clear Gemini API key: %s", esp_err_to_name(err));
+        ESP_LOGE(kSettingsTag, "Failed to clear OpenRouter API key: %s", esp_err_to_name(err));
         return false;
     }
     return true;
@@ -201,8 +198,8 @@ bool ClearStoredApiKeyFromNvs()
 
 std::string GetSdkConfigApiKey()
 {
-#if defined(CONFIG_FOLLOWUP_GEMINI_API_KEY)
-    return TrimCopy(CONFIG_FOLLOWUP_GEMINI_API_KEY);
+#if defined(CONFIG_FOLLOWUP_OPENROUTER_API_KEY)
+    return TrimCopy(CONFIG_FOLLOWUP_OPENROUTER_API_KEY);
 #else
     return {};
 #endif
@@ -313,12 +310,14 @@ esp_err_t HttpEventHandler(esp_http_client_event_t* event)
         response != nullptr &&
         event->data != nullptr &&
         event->data_len > 0) {
-        response->body.append(static_cast<const char*>(event->data),
-                              static_cast<size_t>(event->data_len));
-    } else if (event->event_id == HTTP_EVENT_ON_HEADER && response != nullptr &&
-               event->header_key != nullptr && event->header_value != nullptr &&
-               strcasecmp(event->header_key, "x-goog-upload-url") == 0) {
-        response->upload_url = event->header_value;
+        if (response->body.size() + static_cast<size_t>(event->data_len) > kMaxResponseBytes) {
+            response->error_code = "response_too_large";
+            response->error_message = "Provider response exceeded 256 KiB";
+            return ESP_FAIL;
+        }
+        if (response->error_code.empty()) {
+            response->body.append(static_cast<const char*>(event->data), event->data_len);
+        }
     }
     return ESP_OK;
 }
@@ -360,17 +359,18 @@ void PopulateHttpError(cJSON* root, const HttpResponse& response,
     }
     if (error_message->empty()) {
         *error_message =
-            response.body.empty() ? "Gemini request failed" : response.body;
+            response.body.empty() ? "OpenRouter request failed" : response.body;
     }
     *error_message = TrimForLog(std::move(*error_message));
 }
 
-HttpResponse PerformGeminiModelGet(const std::string& api_key,
+HttpResponse PerformOpenRouterKeyGet(const std::string& api_key,
                                    const std::string& model_name)
 {
     HttpResponse response = {};
-    std::string url = kGeminiApiBaseUrl;
-    url += model_name;
+    std::string url = kOpenRouterApiBaseUrl;
+    url += "key";
+    (void)model_name;
 
     esp_http_client_config_t config = {};
     config.url = url.c_str();
@@ -383,11 +383,12 @@ HttpResponse PerformGeminiModelGet(const std::string& api_key,
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (client == nullptr) {
         response.error_code = "http_client_init_failed";
-        response.error_message = "Failed to initialize Gemini HTTP client";
+        response.error_message = "Failed to initialize OpenRouter HTTP client";
         return response;
     }
 
-    esp_http_client_set_header(client, "x-goog-api-key", api_key.c_str());
+    const std::string authorization = "Bearer " + api_key;
+    esp_http_client_set_header(client, "Authorization", authorization.c_str());
     esp_http_client_set_header(client, "Accept", "application/json");
     esp_http_client_set_header(client, "User-Agent", "folloup-sticky");
 
@@ -395,7 +396,7 @@ HttpResponse PerformGeminiModelGet(const std::string& api_key,
     response.status_code = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
 
-    if (err != ESP_OK) {
+    if (err != ESP_OK && response.error_code.empty()) {
         response.error_code = "transport_error";
         response.error_message = esp_err_to_name(err);
     }
@@ -405,7 +406,7 @@ HttpResponse PerformGeminiModelGet(const std::string& api_key,
 AuthResult Authenticate(const std::string& api_key, const std::string& model_name)
 {
     AuthResult result = {};
-    const HttpResponse http = PerformGeminiModelGet(api_key, model_name);
+    const HttpResponse http = PerformOpenRouterKeyGet(api_key, model_name);
     result.http_status = http.status_code;
 
     if (!http.error_code.empty()) {
@@ -416,9 +417,13 @@ AuthResult Authenticate(const std::string& api_key, const std::string& model_nam
 
     cJSON* root = cJSON_ParseWithLength(http.body.c_str(), http.body.size());
     if (http.status_code >= 200 && http.status_code < 300) {
-        result.success = true;
-        result.model_resource_name = JsonStringField(root, "name");
-        result.model_display_name = JsonStringField(root, "displayName");
+        result.success = cJSON_IsObject(cJSON_GetObjectItemCaseSensitive(root, "data"));
+        result.model_resource_name = model_name;
+        result.model_display_name = "OpenRouter";
+        if (!result.success) {
+            result.error_code = "invalid_response";
+            result.error_message = "Invalid OpenRouter key response";
+        }
         if (root != nullptr) {
             cJSON_Delete(root);
         }
@@ -457,25 +462,25 @@ void CompleteAuthentication(uint32_t generation, const AuthResult& result)
                 s_last_model_display_name = result.model_display_name;
                 s_last_status_message = !s_last_model_display_name.empty()
                                             ? "Authenticated with " + s_last_model_display_name
-                                            : "Authenticated with Gemini";
+                                            : "Authenticated with OpenRouter";
                 ClearLastErrorLocked();
             }
         }
     }
 
     if (stale_result) {
-        ESP_LOGI(kTag, "Ignoring stale Gemini authentication result for generation %lu",
+        ESP_LOGI(kTag, "Ignoring stale OpenRouter authentication result for generation %lu",
                  static_cast<unsigned long>(generation));
         return;
     }
 
     if (!result.success) {
-        ESP_LOGW(kTag, "Gemini authentication failed: http=%d code=%s message=%s",
+        ESP_LOGW(kTag, "OpenRouter authentication failed: http=%d code=%s message=%s",
                  result.http_status,
                  result.error_code.empty() ? "http_error" : result.error_code.c_str(),
                  result.error_message.empty() ? "unknown" : result.error_message.c_str());
     } else {
-        ESP_LOGI(kTag, "Gemini authentication succeeded: model=%s display=%s http=%d",
+        ESP_LOGI(kTag, "OpenRouter authentication succeeded: model=%s display=%s http=%d",
                  result.model_resource_name.empty() ? "unknown"
                                                     : result.model_resource_name.c_str(),
                  result.model_display_name.empty() ? "unknown"
@@ -496,7 +501,7 @@ void AuthenticationTask(void* arg)
             .model_resource_name = {},
             .model_display_name = {},
             .error_code = "task_context_missing",
-            .error_message = "Gemini authentication task context missing",
+            .error_message = "OpenRouter authentication task context missing",
         });
         vTaskDelete(nullptr);
         return;
@@ -597,6 +602,7 @@ void AppendSnapshot(cJSON* root, const Snapshot& snapshot, const char* message)
     cJSON_AddStringToObject(settings, "api_key_last4",
                             snapshot.settings.api_key_last4.c_str());
     cJSON_AddStringToObject(settings, "model_name", snapshot.settings.model_name.c_str());
+    cJSON_AddStringToObject(settings, "transcription_model", CONFIG_FOLLOWUP_OPENROUTER_STT_MODEL);
 
     cJSON* runtime = cJSON_AddObjectToObject(root, "runtime");
     cJSON_AddBoolToObject(runtime, "initialized", snapshot.runtime.initialized);
@@ -659,7 +665,7 @@ esp_err_t RegisterPortalRoute(httpd_handle_t server, const httpd_uri_t* handler)
 
     const esp_err_t err = httpd_register_uri_handler(server, handler);
     if (err != ESP_OK) {
-        ESP_LOGE(kTag, "Failed to register Gemini portal route %s [%d]: %s",
+        ESP_LOGE(kTag, "Failed to register OpenRouter portal route %s [%d]: %s",
                  handler->uri != nullptr ? handler->uri : "<null>",
                  static_cast<int>(handler->method),
                  esp_err_to_name(err));
@@ -670,7 +676,7 @@ esp_err_t RegisterPortalRoute(httpd_handle_t server, const httpd_uri_t* handler)
 esp_err_t HandlePortalSettingsGet(httpd_req_t* request)
 {
     cJSON* root = cJSON_CreateObject();
-    AppendSnapshot(root, GetSnapshot(), "Gemini settings loaded");
+    AppendSnapshot(root, GetSnapshot(), "OpenRouter settings loaded");
     return SendJsonResponse(request, 200, root);
 }
 
@@ -681,7 +687,7 @@ esp_err_t HandlePortalSettingsPatch(httpd_req_t* request)
         request->content_len > static_cast<int>(kMaxPortalPayloadLen)) {
         cJSON* root = cJSON_CreateObject();
         cJSON_AddBoolToObject(root, "success", false);
-        cJSON_AddStringToObject(root, "message", "Invalid Gemini settings payload");
+        cJSON_AddStringToObject(root, "message", "Invalid OpenRouter settings payload");
         return SendJsonResponse(request, 400, root);
     }
 
@@ -692,7 +698,7 @@ esp_err_t HandlePortalSettingsPatch(httpd_req_t* request)
         cJSON* root = cJSON_CreateObject();
         cJSON_AddBoolToObject(root, "success", false);
         cJSON_AddStringToObject(root, "message",
-                                parse_error.empty() ? "Invalid Gemini settings payload"
+                                parse_error.empty() ? "Invalid OpenRouter settings payload"
                                                     : parse_error.c_str());
         return SendJsonResponse(request, 400, root);
     }
@@ -708,7 +714,7 @@ esp_err_t HandlePortalSettingsPatch(httpd_req_t* request)
     }
 
     cJSON* root = cJSON_CreateObject();
-    AppendSnapshot(root, GetSnapshot(), "Gemini API key stored");
+    AppendSnapshot(root, GetSnapshot(), "OpenRouter API key stored");
     return SendJsonResponse(request, 200, root);
 }
 
@@ -725,22 +731,27 @@ esp_err_t HandlePortalSettingsReset(httpd_req_t* request)
     }
 
     cJSON* root = cJSON_CreateObject();
-    AppendSnapshot(root, GetSnapshot(), "Gemini API key cleared");
+    AppendSnapshot(root, GetSnapshot(), "OpenRouter API key cleared");
     return SendJsonResponse(request, 200, root);
 }
 
 esp_err_t HandlePortalRuntimeGet(httpd_req_t* request)
 {
     cJSON* root = cJSON_CreateObject();
-    AppendSnapshot(root, GetSnapshot(), "Gemini runtime loaded");
+    AppendSnapshot(root, GetSnapshot(), "OpenRouter runtime loaded");
     return SendJsonResponse(request, 200, root);
 }
 
-// Synchronous JSON POST to a Gemini endpoint (generateContent / countTokens).
-HttpResponse PerformGeminiPost(const std::string& url, const std::string& api_key,
+// Synchronous JSON POST to OpenRouter.
+HttpResponse PerformOpenRouterPost(const std::string& url, const std::string& api_key,
                                const std::string& body)
 {
     HttpResponse response = {};
+    if (body.empty()) {
+        response.error_code = "request_build_failed";
+        response.error_message = "Failed to allocate request JSON";
+        return response;
+    }
 
     esp_http_client_config_t config = {};
     config.url = url.c_str();
@@ -753,11 +764,12 @@ HttpResponse PerformGeminiPost(const std::string& url, const std::string& api_ke
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (client == nullptr) {
         response.error_code = "http_client_init_failed";
-        response.error_message = "Failed to initialize Gemini HTTP client";
+        response.error_message = "Failed to initialize OpenRouter HTTP client";
         return response;
     }
 
-    esp_http_client_set_header(client, "x-goog-api-key", api_key.c_str());
+    const std::string authorization = "Bearer " + api_key;
+    esp_http_client_set_header(client, "Authorization", authorization.c_str());
     esp_http_client_set_header(client, "Content-Type", "application/json");
     esp_http_client_set_header(client, "Accept", "application/json");
     esp_http_client_set_header(client, "User-Agent", "folloup-sticky");
@@ -767,81 +779,11 @@ HttpResponse PerformGeminiPost(const std::string& url, const std::string& api_ke
     response.status_code = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
 
-    if (err != ESP_OK) {
+    if (err != ESP_OK && response.error_code.empty()) {
         response.error_code = "transport_error";
         response.error_message = esp_err_to_name(err);
     }
     return response;
-}
-
-// A single text-part prompt: {"contents":[{"parts":[{"text": prompt}]}]}. temperature=0 keeps
-// summaries deterministic; countTokens ignores generationConfig, so it is harmless there.
-std::string BuildTextRequestBody(const std::string& prompt, bool include_generation_config)
-{
-    cJSON* root = cJSON_CreateObject();
-    cJSON* contents = cJSON_AddArrayToObject(root, "contents");
-    cJSON* content = cJSON_CreateObject();
-    cJSON_AddItemToArray(contents, content);
-    cJSON* parts = cJSON_AddArrayToObject(content, "parts");
-    cJSON* prompt_part = cJSON_CreateObject();
-    cJSON_AddStringToObject(prompt_part, "text", prompt.c_str());
-    cJSON_AddItemToArray(parts, prompt_part);
-    if (include_generation_config) {
-        cJSON* generation_config = cJSON_AddObjectToObject(root, "generationConfig");
-        cJSON_AddNumberToObject(generation_config, "temperature", 0);
-    }
-
-    char* raw = cJSON_PrintUnformatted(root);
-    std::string body = raw != nullptr ? raw : "";
-    if (raw != nullptr) {
-        cJSON_free(raw);
-    }
-    cJSON_Delete(root);
-    return body;
-}
-
-// Concatenate the text of every part in candidates[0].content.parts[].
-std::string ExtractCandidateText(cJSON* root)
-{
-    if (root == nullptr) {
-        return {};
-    }
-    cJSON* candidates = cJSON_GetObjectItemCaseSensitive(root, "candidates");
-    if (!cJSON_IsArray(candidates)) {
-        return {};
-    }
-    cJSON* candidate = cJSON_GetArrayItem(candidates, 0);
-    if (!cJSON_IsObject(candidate)) {
-        return {};
-    }
-    cJSON* content = cJSON_GetObjectItemCaseSensitive(candidate, "content");
-    if (!cJSON_IsObject(content)) {
-        return {};
-    }
-    cJSON* parts = cJSON_GetObjectItemCaseSensitive(content, "parts");
-    if (!cJSON_IsArray(parts)) {
-        return {};
-    }
-    std::string text;
-    cJSON* part = nullptr;
-    cJSON_ArrayForEach(part, parts)
-    {
-        const std::string part_text = JsonStringField(part, "text");
-        text += part_text;
-    }
-    return text;
-}
-
-std::string JsonNestedStringField(cJSON* root, const char* first, const char* second)
-{
-    if (root == nullptr) {
-        return {};
-    }
-    cJSON* item = cJSON_GetObjectItemCaseSensitive(root, first);
-    if (!cJSON_IsObject(item)) {
-        return {};
-    }
-    return JsonStringField(item, second);
 }
 
 void AppendLe16(uint16_t value, std::array<uint8_t, 44>* out, size_t* offset)
@@ -918,168 +860,75 @@ bool ReadHttpResponseBody(esp_http_client_handle_t client, HttpResponse* respons
         if (read == 0) {
             break;
         }
+        if (response->body.size() + static_cast<size_t>(read) > kMaxResponseBytes) {
+            response->error_code = "response_too_large";
+            response->error_message = "Provider response exceeded 256 KiB";
+            return false;
+        }
         response->body.append(buffer.data(), static_cast<size_t>(read));
     }
     return true;
 }
 
-HttpResponse PerformUploadStart(const std::string& api_key, size_t num_bytes)
+HttpResponse PerformAudioTranscription(const std::string& api_key,
+                                      const recording_service::RecordedClip& clip)
 {
     HttpResponse response = {};
-
+    const std::string prefix = openrouter_protocol::AudioPrefix(CONFIG_FOLLOWUP_OPENROUTER_STT_MODEL);
+    const std::string suffix = openrouter_protocol::AudioSuffix();
+    const size_t total_bytes = prefix.size() + clip.wav_byte_count() + suffix.size();
+    if (total_bytes > INT_MAX) {
+        response.error_code = "audio_too_large";
+        response.error_message = "Recording exceeds upload size limit";
+        return response;
+    }
     esp_http_client_config_t config = {};
-    config.url = kUploadUrl;
+    config.url = "https://openrouter.ai/api/v1/audio/transcriptions";
     config.method = HTTP_METHOD_POST;
     config.crt_bundle_attach = esp_crt_bundle_attach;
     config.timeout_ms = kTranscribeTimeoutMs;
-    config.event_handler = &HttpEventHandler;
-    config.user_data = &response;
-
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (client == nullptr) {
         response.error_code = "http_client_init_failed";
-        response.error_message = "Failed to initialize Gemini upload client";
+        response.error_message = "Failed to initialize audio HTTP client";
         return response;
     }
-
-    char content_length[32] = {};
-    std::snprintf(content_length, sizeof(content_length), "%u", static_cast<unsigned>(num_bytes));
-    static constexpr const char* metadata = "{\"file\":{\"display_name\":\"STICKY_NOTE\"}}";
-    esp_http_client_set_header(client, "x-goog-api-key", api_key.c_str());
-    esp_http_client_set_header(client, "X-Goog-Upload-Protocol", "resumable");
-    esp_http_client_set_header(client, "X-Goog-Upload-Command", "start");
-    esp_http_client_set_header(client, "X-Goog-Upload-Header-Content-Length", content_length);
-    esp_http_client_set_header(client, "X-Goog-Upload-Header-Content-Type", kAudioMimeType);
-    esp_http_client_set_header(client, "Content-Type", "application/json");
-    esp_http_client_set_post_field(client, metadata, std::strlen(metadata));
-
-    const esp_err_t err = esp_http_client_perform(client);
-    response.status_code = esp_http_client_get_status_code(client);
-    esp_http_client_cleanup(client);
-    if (err != ESP_OK) {
-        response.error_code = "transport_error";
-        response.error_message = esp_err_to_name(err);
-    }
-    return response;
-}
-
-HttpResponse PerformUploadFinalizePcmWav(const std::string& upload_url,
-                                         const recording_service::RecordedClip& clip)
-{
-    HttpResponse response = {};
-
-    esp_http_client_config_t config = {};
-    config.url = upload_url.c_str();
-    config.method = HTTP_METHOD_POST;
-    config.crt_bundle_attach = esp_crt_bundle_attach;
-    config.timeout_ms = kTranscribeTimeoutMs;
-
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (client == nullptr) {
-        response.error_code = "http_client_init_failed";
-        response.error_message = "Failed to initialize Gemini upload finalize client";
-        return response;
-    }
-
-    const size_t total_bytes = clip.wav_byte_count();
-    char content_length[32] = {};
-    std::snprintf(content_length, sizeof(content_length), "%u", static_cast<unsigned>(total_bytes));
-    esp_http_client_set_header(client, "Content-Length", content_length);
+    const std::string authorization = "Bearer " + api_key;
+    esp_http_client_set_header(client, "Authorization", authorization.c_str());
+    esp_http_client_set_header(client, "Content-Type", openrouter_protocol::kAudioContentType);
     esp_http_client_set_header(client, "Accept", "application/json");
-    esp_http_client_set_header(client, "X-Goog-Upload-Offset", "0");
-    esp_http_client_set_header(client, "X-Goog-Upload-Command", "upload, finalize");
-
-    esp_err_t err = esp_http_client_open(client, total_bytes);
-    if (err != ESP_OK) {
+    const int64_t upload_started_us = esp_timer_get_time();
+    const esp_err_t err = esp_http_client_open(client, static_cast<int>(total_bytes));
+    if (err != ESP_OK && response.error_code.empty()) {
         response.error_code = "transport_error";
         response.error_message = esp_err_to_name(err);
         esp_http_client_cleanup(client);
         return response;
     }
-
-    const std::array<uint8_t, 44> header =
-        BuildWavHeaderPcm16Mono(clip.sample_count(), clip.sample_rate_hz());
-    const int header_written = esp_http_client_write(
-        client, reinterpret_cast<const char*>(header.data()), static_cast<int>(header.size()));
-    if (header_written != static_cast<int>(header.size())) {
-        response.error_code = "transport_error";
-        response.error_message = "Failed writing WAV header";
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        return response;
-    }
-
-    bool write_failed = false;
-    clip.ForEachChunk([&](const int16_t* chunk_data, size_t chunk_size) {
-        if (write_failed || chunk_data == nullptr || chunk_size == 0) {
-            return;
-        }
-        const int bytes_to_write = static_cast<int>(chunk_size * sizeof(int16_t));
-        const int written =
-            esp_http_client_write(client, reinterpret_cast<const char*>(chunk_data), bytes_to_write);
-        if (written != bytes_to_write) {
-            write_failed = true;
-        }
+    auto write_all = [&](const void* data, size_t size) {
+        return openrouter_protocol::WriteAll(static_cast<const char*>(data), size,
+            [&](const char* bytes, int count) { return esp_http_client_write(client, bytes, count); });
+    };
+    const auto header = BuildWavHeaderPcm16Mono(clip.sample_count(), clip.sample_rate_hz());
+    bool ok = write_all(prefix.data(), prefix.size()) && write_all(header.data(), header.size());
+    clip.ForEachChunk([&](const int16_t* data, size_t size) {
+        if (ok && size != 0) ok = data != nullptr && write_all(data, size * sizeof(int16_t));
     });
-    if (write_failed) {
+    ok = ok && write_all(suffix.data(), suffix.size());
+    response.upload_elapsed_ms = (esp_timer_get_time() - upload_started_us) / 1000ULL;
+    if (!ok) {
         response.error_code = "transport_error";
-        response.error_message = "Failed streaming Gemini audio upload";
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        return response;
-    }
-
-    const int response_length = esp_http_client_fetch_headers(client);
-    response.status_code = esp_http_client_get_status_code(client);
-    if (response.status_code <= 0 && response_length < 0) {
+        response.error_message = "Failed streaming audio upload";
+    } else if (esp_http_client_fetch_headers(client) < 0) {
         response.error_code = "transport_error";
-        response.error_message = "Failed fetching Gemini upload response headers";
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        return response;
+        response.error_message = "Failed reading audio response headers";
+    } else {
+        response.status_code = esp_http_client_get_status_code(client);
+        ReadHttpResponseBody(client, &response);
     }
-    ReadHttpResponseBody(client, &response);
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
     return response;
-}
-
-std::string BuildTranscriptRequestJson(const std::string& file_uri)
-{
-    cJSON* root = cJSON_CreateObject();
-    cJSON* contents = cJSON_AddArrayToObject(root, "contents");
-    cJSON* content = cJSON_CreateObject();
-    cJSON_AddItemToArray(contents, content);
-    cJSON* parts = cJSON_AddArrayToObject(content, "parts");
-
-    cJSON* prompt_part = cJSON_CreateObject();
-    cJSON_AddStringToObject(prompt_part, "text", kTranscriptPrompt);
-    cJSON_AddItemToArray(parts, prompt_part);
-
-    cJSON* audio_part = cJSON_CreateObject();
-    cJSON* file_data = cJSON_AddObjectToObject(audio_part, "fileData");
-    cJSON_AddStringToObject(file_data, "mimeType", kAudioMimeType);
-    cJSON_AddStringToObject(file_data, "fileUri", file_uri.c_str());
-    cJSON_AddItemToArray(parts, audio_part);
-
-    cJSON* generation_config = cJSON_AddObjectToObject(root, "generationConfig");
-    cJSON_AddNumberToObject(generation_config, "temperature", 0);
-
-    char* raw = cJSON_PrintUnformatted(root);
-    std::string json = raw != nullptr ? raw : "";
-    if (raw != nullptr) {
-        cJSON_free(raw);
-    }
-    cJSON_Delete(root);
-    return json;
-}
-
-HttpResponse PerformGenerateContentWithBody(const std::string& api_key,
-                                            const std::string& model_name,
-                                            const std::string& request_json)
-{
-    const std::string url = std::string(kGeminiApiBaseUrl) + model_name + ":generateContent";
-    return PerformGeminiPost(url, api_key, request_json);
 }
 
 uint32_t ResolveUploadChunkCount(const recording_service::RecordedClip& clip)
@@ -1102,14 +951,14 @@ esp_err_t Init()
         s_stored_api_key = LoadStoredApiKey();
         s_last_status_message =
             GetEffectiveApiKeyLocked().empty()
-                ? "No Gemini API key configured"
-                : "Gemini API key available";
+                ? "No OpenRouter API key configured"
+                : "OpenRouter API key available";
         ClearLastErrorLocked();
         s_initialized = true;
         snapshot = BuildSnapshotLocked();
     }
 
-    ESP_LOGI(kTag, "Gemini service initialized: configured=%d source=%s key_last4=%s",
+    ESP_LOGI(kTag, "OpenRouter service initialized: configured=%d source=%s key_last4=%s",
              snapshot.settings.configured ? 1 : 0,
              ApiKeySourceName(snapshot.settings.api_key_source),
              snapshot.settings.api_key_last4.empty()
@@ -1151,24 +1000,25 @@ Result ApplySettingsPatch(const SettingsPatch& patch)
                 .status_code = 400,
                 .field = "api_key",
                 .error_code = "missing_api_key",
-                .message = "Gemini API key is required",
+                .message = "OpenRouter API key is required",
             };
         }
 
         const std::string trimmed = TrimCopy(patch.api_key);
-        if (trimmed.empty()) {
+        if (trimmed.empty() || trimmed.size() > 256 ||
+            trimmed.find_first_of("\r\n") != std::string::npos) {
             return {
                 .success = false,
                 .validation_error = true,
                 .status_code = 400,
                 .field = "api_key",
                 .error_code = "invalid_api_key",
-                .message = "Gemini API key is required",
+                .message = "OpenRouter API key is required",
             };
         }
 
         if (!SaveStoredApiKey(trimmed)) {
-            SetLastErrorLocked("nvs_write_failed", "Failed to store Gemini API key");
+            SetLastErrorLocked("nvs_write_failed", "Failed to store OpenRouter API key");
             save_failed = true;
         } else {
             s_stored_api_key = trimmed;
@@ -1177,7 +1027,7 @@ Result ApplySettingsPatch(const SettingsPatch& patch)
             s_auth_checked = false;
             s_authenticated = false;
             s_last_http_status = 0;
-            s_last_status_message = "Gemini API key stored";
+            s_last_status_message = "OpenRouter API key stored";
             s_last_model_resource_name.clear();
             s_last_model_display_name.clear();
             ClearLastErrorLocked();
@@ -1193,7 +1043,7 @@ Result ApplySettingsPatch(const SettingsPatch& patch)
             .status_code = 500,
             .field = "api_key",
             .error_code = "nvs_write_failed",
-            .message = "Failed to store Gemini API key",
+            .message = "Failed to store OpenRouter API key",
         };
     }
 
@@ -1207,7 +1057,7 @@ Result ApplySettingsPatch(const SettingsPatch& patch)
         .status_code = 200,
         .field = {},
         .error_code = {},
-        .message = "Gemini API key stored",
+        .message = "OpenRouter API key stored",
     };
 }
 
@@ -1223,7 +1073,7 @@ Result ClearStoredApiKey()
         }
 
         if (!ClearStoredApiKeyFromNvs()) {
-            SetLastErrorLocked("nvs_clear_failed", "Failed to clear Gemini API key");
+            SetLastErrorLocked("nvs_clear_failed", "Failed to clear OpenRouter API key");
             clear_failed = true;
         } else {
             s_stored_api_key.clear();
@@ -1232,7 +1082,7 @@ Result ClearStoredApiKey()
             s_auth_checked = false;
             s_authenticated = false;
             s_last_http_status = 0;
-            s_last_status_message = "Gemini API key cleared";
+            s_last_status_message = "OpenRouter API key cleared";
             s_last_model_resource_name.clear();
             s_last_model_display_name.clear();
             ClearLastErrorLocked();
@@ -1248,7 +1098,7 @@ Result ClearStoredApiKey()
             .status_code = 500,
             .field = "api_key",
             .error_code = "nvs_clear_failed",
-            .message = "Failed to clear Gemini API key",
+            .message = "Failed to clear OpenRouter API key",
         };
     }
 
@@ -1261,7 +1111,7 @@ Result ClearStoredApiKey()
         .status_code = 200,
         .field = {},
         .error_code = {},
-        .message = "Gemini API key cleared",
+        .message = "OpenRouter API key cleared",
     };
 }
 
@@ -1289,7 +1139,7 @@ TextResult GenerateText(const std::string& prompt)
     const std::string model_name = GetEffectiveModelName();
     if (api_key.empty() || model_name.empty()) {
         result.error_code = "not_configured";
-        result.error_message = "No Gemini API key configured";
+        result.error_message = "No OpenRouter API key configured";
         return result;
     }
     if (prompt.empty()) {
@@ -1298,8 +1148,8 @@ TextResult GenerateText(const std::string& prompt)
         return result;
     }
 
-    const std::string url = std::string(kGeminiApiBaseUrl) + model_name + ":generateContent";
-    const HttpResponse http = PerformGeminiPost(url, api_key, BuildTextRequestBody(prompt, true));
+    const std::string url = std::string(kOpenRouterApiBaseUrl) + "chat/completions";
+    const HttpResponse http = PerformOpenRouterPost(url, api_key, openrouter_protocol::TextRequest(model_name, prompt));
     result.http_status = http.status_code;
     if (!http.error_code.empty()) {
         result.error_code = http.error_code;
@@ -1307,11 +1157,11 @@ TextResult GenerateText(const std::string& prompt)
     } else {
         cJSON* root = cJSON_ParseWithLength(http.body.c_str(), http.body.size());
         if (http.status_code >= 200 && http.status_code < 300) {
-            result.text = ExtractCandidateText(root);
+            result.text = openrouter_protocol::CompletionText(root);
             result.success = !result.text.empty();
             if (!result.success) {
                 result.error_code = "empty_response";
-                result.error_message = "Gemini returned no text";
+                result.error_message = "OpenRouter returned no text";
             }
         } else {
             PopulateHttpError(root, http, &result.error_code, &result.error_message);
@@ -1322,63 +1172,13 @@ TextResult GenerateText(const std::string& prompt)
     }
 
     if (result.success) {
-        ESP_LOGI(kTag, "Gemini generateContent succeeded: http=%d chars=%u", result.http_status,
+        ESP_LOGI(kTag, "OpenRouter chat completion succeeded: http=%d chars=%u", result.http_status,
                  static_cast<unsigned>(result.text.size()));
     } else {
-        ESP_LOGW(kTag, "Gemini generateContent failed: http=%d code=%s message=%s",
+        ESP_LOGW(kTag, "OpenRouter chat completion failed: http=%d code=%s message=%s",
                  result.http_status,
                  result.error_code.empty() ? "<none>" : result.error_code.c_str(),
                  result.error_message.empty() ? "<none>" : result.error_message.c_str());
-    }
-    return result;
-}
-
-TokenCountResult CountTokens(const std::string& prompt)
-{
-    TokenCountResult result = {};
-    const std::string api_key = GetEffectiveApiKey();
-    const std::string model_name = GetEffectiveModelName();
-    if (api_key.empty() || model_name.empty()) {
-        result.error_code = "not_configured";
-        result.error_message = "No Gemini API key configured";
-        return result;
-    }
-    if (prompt.empty()) {
-        result.success = true;  // an empty prompt is trivially zero tokens
-        return result;
-    }
-
-    const std::string url = std::string(kGeminiApiBaseUrl) + model_name + ":countTokens";
-    const HttpResponse http = PerformGeminiPost(url, api_key, BuildTextRequestBody(prompt, false));
-    result.http_status = http.status_code;
-    if (!http.error_code.empty()) {
-        result.error_code = http.error_code;
-        result.error_message = TrimForLog(http.error_message);
-        return result;
-    }
-
-    cJSON* root = cJSON_ParseWithLength(http.body.c_str(), http.body.size());
-    if (http.status_code >= 200 && http.status_code < 300) {
-        cJSON* total = root != nullptr
-                           ? cJSON_GetObjectItemCaseSensitive(root, "totalTokens")
-                           : nullptr;
-        if (cJSON_IsNumber(total)) {
-            result.total_tokens = total->valueint;
-            result.success = true;
-        } else {
-            result.error_code = "empty_response";
-            result.error_message = "Gemini returned no token count";
-        }
-    } else {
-        PopulateHttpError(root, http, &result.error_code, &result.error_message);
-    }
-    if (root != nullptr) {
-        cJSON_Delete(root);
-    }
-    if (!result.success) {
-        // Callers fall back to a size estimate, so this is debug-level to avoid chunking noise.
-        ESP_LOGD(kTag, "Gemini countTokens failed: http=%d code=%s", result.http_status,
-                 result.error_code.empty() ? "<none>" : result.error_code.c_str());
     }
     return result;
 }
@@ -1394,7 +1194,7 @@ TranscriptionResult Transcribe(const recording_service::RecordedClip& clip)
     const std::string model_name = GetEffectiveModelName();
     if (api_key.empty() || model_name.empty()) {
         result.error_code = "not_configured";
-        result.error_message = "No Gemini API key configured";
+        result.error_message = "No OpenRouter API key configured";
         return result;
     }
     if (clip.empty()) {
@@ -1405,54 +1205,8 @@ TranscriptionResult Transcribe(const recording_service::RecordedClip& clip)
 
     const int64_t task_started_us = esp_timer_get_time();
 
-    // 1. Start a resumable upload to obtain an upload URL.
-    HttpResponse upload_start = PerformUploadStart(api_key, clip.wav_byte_count());
-    if (!upload_start.error_code.empty() || upload_start.upload_url.empty() ||
-        upload_start.status_code < 200 || upload_start.status_code >= 300) {
-        result.http_status = upload_start.status_code;
-        result.error_code =
-            upload_start.error_code.empty() ? "upload_start_failed" : upload_start.error_code;
-        result.error_message = TrimForLog(
-            !upload_start.error_message.empty()
-                ? upload_start.error_message
-                : (!upload_start.body.empty() ? upload_start.body
-                                              : "Failed to start Gemini file upload"));
-        return result;
-    }
-
-    // 2. Stream the WAV (header + PCM chunks) and finalize the upload.
-    const int64_t upload_started_us = esp_timer_get_time();
-    HttpResponse upload_finalize = PerformUploadFinalizePcmWav(upload_start.upload_url, clip);
-    result.http_status = upload_finalize.status_code;
-    result.upload_elapsed_ms =
-        static_cast<uint64_t>((esp_timer_get_time() - upload_started_us) / 1000ULL);
-    if (!upload_finalize.error_code.empty() || upload_finalize.status_code < 200 ||
-        upload_finalize.status_code >= 300) {
-        result.error_code = upload_finalize.error_code.empty() ? "upload_finalize_failed"
-                                                               : upload_finalize.error_code;
-        result.error_message = TrimForLog(
-            !upload_finalize.error_message.empty()
-                ? upload_finalize.error_message
-                : (!upload_finalize.body.empty() ? upload_finalize.body
-                                                 : "Failed to upload Gemini audio file"));
-        return result;
-    }
-
-    cJSON* file_root =
-        cJSON_ParseWithLength(upload_finalize.body.c_str(), upload_finalize.body.size());
-    const std::string file_uri = JsonNestedStringField(file_root, "file", "uri");
-    if (file_root != nullptr) {
-        cJSON_Delete(file_root);
-    }
-    if (file_uri.empty()) {
-        result.error_code = "file_uri_missing";
-        result.error_message = "Gemini upload did not return a file URI";
-        return result;
-    }
-
-    // 3. generateContent referencing the uploaded file.
-    HttpResponse http =
-        PerformGenerateContentWithBody(api_key, model_name, BuildTranscriptRequestJson(file_uri));
+    const HttpResponse http = PerformAudioTranscription(api_key, clip);
+    result.upload_elapsed_ms = http.upload_elapsed_ms;
     result.http_status = http.status_code;
     result.total_elapsed_ms =
         static_cast<uint64_t>((esp_timer_get_time() - task_started_us) / 1000ULL);
@@ -1464,11 +1218,11 @@ TranscriptionResult Transcribe(const recording_service::RecordedClip& clip)
 
     cJSON* root = cJSON_ParseWithLength(http.body.c_str(), http.body.size());
     if (http.status_code >= 200 && http.status_code < 300) {
-        result.transcript = TrimForLog(ExtractCandidateText(root), 1U << 20);
+        result.transcript = TrimCopy(JsonStringField(root, "text"));
         result.success = !result.transcript.empty();
         if (!result.success) {
             result.error_code = "empty_transcript";
-            result.error_message = "Gemini returned no transcript text";
+            result.error_message = "OpenRouter returned no transcript text";
         }
     } else {
         PopulateHttpError(root, http, &result.error_code, &result.error_message);
@@ -1508,7 +1262,7 @@ bool BeginAuthentication()
             s_last_status_message = "Authentication skipped";
             s_last_model_resource_name.clear();
             s_last_model_display_name.clear();
-            SetLastErrorLocked("not_configured", "No Gemini API key configured");
+            SetLastErrorLocked("not_configured", "No OpenRouter API key configured");
             missing_api_key = true;
         } else if (!s_network_connected) {
             return false;
@@ -1519,7 +1273,7 @@ bool BeginAuthentication()
             s_auth_checked = false;
             s_authenticated = false;
             s_last_http_status = 0;
-            s_last_status_message = "Authenticating with Gemini";
+            s_last_status_message = "Authenticating with OpenRouter";
             s_last_model_resource_name.clear();
             s_last_model_display_name.clear();
             ClearLastErrorLocked();
@@ -1565,17 +1319,17 @@ bool BeginAuthentication()
         {
             std::lock_guard<std::mutex> lock(s_mutex);
             s_request_in_flight = false;
-            s_last_status_message = "Failed to start Gemini authentication";
+            s_last_status_message = "Failed to start OpenRouter authentication";
             SetLastErrorLocked(task_alloc_failed ? "task_alloc_failed" : "task_start_failed",
                                task_alloc_failed
-                                   ? "Failed to allocate Gemini task context"
-                                   : "Failed to start Gemini authentication task");
+                                   ? "Failed to allocate OpenRouter task context"
+                                   : "Failed to start OpenRouter authentication task");
         }
         Notify();
         return false;
     }
 
-    ESP_LOGI(kTag, "Starting Gemini authentication (model=%s, source=%s, key_last4=%s)",
+    ESP_LOGI(kTag, "Starting OpenRouter authentication (model=%s, source=%s, key_last4=%s)",
              GetEffectiveModelName().c_str(),
              ApiKeySourceName(api_key_source),
              api_key_last4.empty() ? "none" : api_key_last4.c_str());
@@ -1627,7 +1381,7 @@ void RegisterPortalRoutes(httpd_handle_t server)
         RegisterPortalRoute(server, &settings_patch) != ESP_OK ||
         RegisterPortalRoute(server, &settings_reset) != ESP_OK ||
         RegisterPortalRoute(server, &runtime_get) != ESP_OK) {
-        ESP_LOGW(kTag, "Gemini portal routes are incomplete");
+        ESP_LOGW(kTag, "OpenRouter portal routes are incomplete");
     }
 }
 

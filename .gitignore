@@ -52,6 +52,9 @@ dependencies.lock
 # untracked so credentials cannot reach a commit; sdkconfig.defaults is the tracked one.
 sdkconfig
 sdkconfig.old
+.env
+.env.*
+!.env.example
 *.map
 flasher_args.json
 flash_project_args
@@ -87,3 +90,9 @@ Testing/
 # Python bytecode cache
 __pycache__/
 *.pyc
+
+# Local runtime/build output
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage

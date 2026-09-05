@@ -52,13 +52,21 @@ menu "Folloup Settings"
             one step every interval, so it changes over time without being
             tied to the calendar.
 
-    config FOLLOWUP_GEMINI_API_KEY
-        string "Built-in Gemini API key"
+    config FOLLOWUP_OPENROUTER_API_KEY
+        string "Built-in OpenRouter API key"
         default ""
         help
-            Optional built-in Gemini API key used for testing. A runtime-saved
-            Gemini API key stored through the backend portal takes precedence
+            Optional built-in OpenRouter API key used for testing. A runtime-saved
+            OpenRouter API key stored through the backend portal takes precedence
             when present.
+
+    config FOLLOWUP_OPENROUTER_STT_MODEL
+        string "OpenRouter transcription model"
+        default "microsoft/mai-transcribe-2"
+
+    config FOLLOWUP_OPENROUTER_TEXT_MODEL
+        string "OpenRouter text model"
+        default "qwen/qwen3-30b-a3b-instruct-2507"
 
     config FOLLOWUP_AUTO_SLEEP_DISPLAY_SLEEP_TIMEOUT_SECONDS
         int "Display sleep timeout"

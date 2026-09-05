@@ -94,15 +94,15 @@ bool IsNotesRecordingTag(RecordingTag tag)
 
 size_t EstimateTokenCount(const std::string& text)
 {
-    return std::max<size_t>(1U, text.size() / 4U);
+    // ponytail: UTF-8 byte count is a conservative token budget; use a tokenizer if chunking is costly.
+    return text.size();
 }
 
 // --- gemini wrappers (synchronous; run on the worker task) -----------------
 
 size_t CountPromptTokens(const std::string& prompt)
 {
-    const gemini_service::TokenCountResult result = gemini_service::CountTokens(prompt);
-    return result.success ? static_cast<size_t>(result.total_tokens) : EstimateTokenCount(prompt);
+    return EstimateTokenCount(prompt);
 }
 
 bool GeneratePromptTextResult(const std::string& prompt, std::string* text_out,
@@ -116,7 +116,7 @@ bool GeneratePromptTextResult(const std::string& prompt, std::string* text_out,
         }
         if (error_message_out != nullptr) {
             *error_message_out =
-                result.error_message.empty() ? "Gemini summary request failed" : result.error_message;
+                result.error_message.empty() ? "OpenRouter summary request failed" : result.error_message;
         }
         return false;
     }
@@ -802,15 +802,15 @@ GenerationResult GenerateSummary(SummaryKind kind)
     const gemini_service::Snapshot gemini_snapshot = gemini_service::GetSnapshot();
     if (!gemini_snapshot.runtime.ready) {
         result.error_code = "gemini_not_ready";
-        result.error_message = "Gemini is not connected";
-        ESP_LOGW(kTag, "Summary aborted: Gemini not connected");
+        result.error_message = "OpenRouter is not connected";
+        ESP_LOGW(kTag, "Summary aborted: OpenRouter not connected");
         return result;
     }
     if (gemini_service::GetEffectiveApiKey().empty() ||
         gemini_service::GetEffectiveModelName().empty()) {
         result.error_code = "gemini_not_configured";
-        result.error_message = "Gemini is not configured";
-        ESP_LOGW(kTag, "Summary aborted: Gemini not configured");
+        result.error_message = "OpenRouter is not configured";
+        ESP_LOGW(kTag, "Summary aborted: OpenRouter not configured");
         return result;
     }
 

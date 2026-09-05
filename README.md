@@ -1,12 +1,16 @@
 # Followup Product Introduction
 
-Followup is a place to capture your thoughts — whether it's an idea, a to-do, or just a note. Record what's on your mind at that light-bulb moment, before it slips away, and Followup helps you organize it afterward. With Gemini, your recordings are transcribed and summarized automatically. Everything is stored on your SD card.
+This fork targets the Waveshare ESP32-S3-ePaper-3.97. Start with the
+[native display lab](emulator/README.md), [local environment setup](docs/local-setup.md),
+and [firmware design review](docs/firmware-design-review.md).
+
+Followup is a place to capture your thoughts — whether it's an idea, a to-do, or just a note. Record what's on your mind at that light-bulb moment, before it slips away, and Followup helps you organize it afterward. With OpenRouter, your recordings are transcribed and summarized automatically. Everything is stored on your SD card.
 
 It runs on the [Waveshare ESP32-S3-ePaper-3.97](https://docs.waveshare.com/ESP32-S3-ePaper-3.97), so your thoughts live on a quiet, always-on screen you can place anywhere — a constant, low-interruption reminder instead of one more notification buried in your phone.
 
 ## One-Sentence Positioning
 
-**Followup is a voice-first thought-capture companion on always-on ePaper: record ideas, to-dos, and notes in the moment, let Gemini transcribe and summarize them, and keep the ones that matter in front of you as stickies.**
+**Followup is a voice-first thought-capture companion on always-on ePaper: record ideas, to-dos, and notes in the moment, let OpenRouter transcribe and summarize them, and keep the ones that matter in front of you as stickies.**
 
 ## What It Is Suitable For
 
@@ -22,11 +26,11 @@ It runs on the [Waveshare ESP32-S3-ePaper-3.97](https://docs.waveshare.com/ESP32
 
 Press record and speak. Every capture starts as a voice recording, tagged as an **Idea**, a **To-do**, or a **Note**, so you can get the thought down the instant it arrives without stopping to type.
 
-### 2. Gemini Transcription and Summarization
+### 2. OpenRouter Transcription and Summarization
 
-Once a recording is saved, Gemini transcribes the audio and summarizes it — turning a rambling voice memo into readable text and a concise summary you can scan at a glance.
+Once a recording is saved, OpenRouter transcribes the audio and summarizes it — turning a rambling voice memo into readable text and a concise summary you can scan at a glance.
 
-A Gemini API key from [Google AI Studio](https://aistudio.google.com/) is required. You can get started on the free tier, subject to Gemini's free-tier limits, or use a paid account to transcribe without those limits.
+An OpenRouter API key from [OpenRouter](https://openrouter.ai/keys) is required. Transcription uses `microsoft/mai-transcribe-2`; summaries use a separately configured text model. An OpenRouter account with credits is required.
 
 ### 3. Everything Stored on Your SD Card
 
@@ -53,7 +57,7 @@ Pin your follow-ups to the ePaper display as sticky notes. Because the screen is
 | Note | Keep a quick thought or reminder, transcribed and summarized |
 | Follow-up | Flag the items that matter so they stay top of mind |
 | Stickies | Display your active follow-ups on the ePaper as always-on reminders |
-| Summaries | Let Gemini condense long recordings into a glanceable summary |
+| Summaries | Let OpenRouter condense long recordings into a glanceable summary |
 
 ## Brief Specifications
 
@@ -72,7 +76,7 @@ Followup runs on the [Waveshare ESP32-S3-ePaper-3.97](https://docs.waveshare.com
 | Sensors | QMI8658 6-axis IMU, PCF85063 real-time clock |
 | Power | AXP2101 PMIC, 3.7V lithium battery (MX1.25 connector), USB-C charging |
 | Storage | microSD card (recordings, transcripts, summaries) |
-| AI | Gemini (cloud) transcription and summarization, over Wi-Fi |
+| AI | OpenRouter (cloud) transcription and summarization, over Wi-Fi |
 
 The board also carries an SHTC3 temperature/humidity sensor on the shared I2C bus. Followup does not currently read it.
 
@@ -95,6 +99,6 @@ Recording is exclusive to BOOT, so no other control can start or stop a capture 
 
 ## Product Value Summary
 
-The value of Followup is a quiet, always-visible place to catch your thoughts and keep the important ones in front of you. Instead of losing an idea to a forgotten note app or burying a task in a notification stream, you speak it in the moment, let Gemini turn it into clean text and a summary, and keep everything private on your SD card.
+The value of Followup is a quiet, always-visible place to catch your thoughts and keep the important ones in front of you. Instead of losing an idea to a forgotten note app or burying a task in a notification stream, you speak it in the moment, let OpenRouter turn it into clean text and a summary, and keep everything private on your SD card.
 
 Ideas get a vibe check so you only carry forward what still matters. Tasks and notes become follow-ups so you stay on track. And the ones you care about most sit on the ePaper as stickies — a steady, low-interruption reminder of what's next.
